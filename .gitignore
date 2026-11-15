@@ -1,0 +1,39 @@
+# Compiled binaries and build artifacts
+/tether
+/tether.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/build/
+
+# Go test binaries and coverage outputs
+*.test
+*.out
+coverage.txt
+coverage.html
+profile.cov
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Environment, secrets, and local logs
+.env
+.env.*
+*.log
+
+# IDE and editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini

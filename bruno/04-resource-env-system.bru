@@ -1,0 +1,41 @@
+meta {
+  name: 04 - Resource tether://env/system
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "resources/read",
+    "params": {
+      "uri": "tether://env/system"
+    }
+  }
+}
+
+tests {
+  test("Returns host OS, shells, and agent workspace_root", function() {
+    expect(res.getStatus()).to.equal(200);
+    const contents = res.getBody().result.contents;
+    expect(contents).to.be.an("array");
+    const data = JSON.parse(contents[0].text);
+    expect(data.agent_id).to.equal(bru.getEnvVar("agent_id"));
+    expect(data.shells).to.be.an("array");
+  });
+}

@@ -1,0 +1,44 @@
+meta {
+  name: 07 - Tool session_exec (Safe Read-Only Command)
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "tools/call",
+    "params": {
+      "name": "session_exec",
+      "arguments": {
+        "session_id": "{{session_id}}",
+        "command": "echo TETHER_BRUNO_SAFE_OK",
+        "timeout_ms": 10000
+      }
+    }
+  }
+}
+
+tests {
+  test("Executes read-only command immediately with exit_code 0", function() {
+    expect(res.getStatus()).to.equal(200);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.exit_code).to.equal(0);
+    expect(parsed.output).to.include("TETHER_BRUNO_SAFE_OK");
+  });
+}

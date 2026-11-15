@@ -1,0 +1,43 @@
+meta {
+  name: 11 - Tool session_screen
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "method": "tools/call",
+    "params": {
+      "name": "session_screen",
+      "arguments": {
+        "session_id": "{{session_id}}",
+        "lines": 30
+      }
+    }
+  }
+}
+
+tests {
+  test("Returns clean ANSI-stripped lines from PTY RingBuffer", function() {
+    expect(res.getStatus()).to.equal(200);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.lines).to.be.an("array");
+    expect(parsed.screen).to.be.a("string");
+  });
+}

@@ -1,0 +1,43 @@
+meta {
+  name: 10 - Tool session_input
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "method": "tools/call",
+    "params": {
+      "name": "session_input",
+      "arguments": {
+        "session_id": "{{session_id}}",
+        "text": "echo INPUT_FROM_BRUNO_OK",
+        "press_enter": true
+      }
+    }
+  }
+}
+
+tests {
+  test("Sends interactive text input to PTY session", function() {
+    expect(res.getStatus()).to.equal(200);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.session_id).to.equal(bru.getEnvVar("session_id"));
+  });
+}

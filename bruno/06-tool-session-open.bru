@@ -1,0 +1,53 @@
+meta {
+  name: 06 - Tool session_open
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "tools/call",
+    "params": {
+      "name": "session_open",
+      "arguments": {
+        "shell": "{{shell}}",
+        "name": "bruno-validation"
+      }
+    }
+  }
+}
+
+script:post-response {
+  try {
+    const content = res.getBody().result.content[0].text;
+    const parsed = JSON.parse(content);
+    if (parsed && parsed.session_id) {
+      bru.setEnvVar("session_id", parsed.session_id);
+    }
+  } catch (e) {}
+}
+
+tests {
+  test("Opens new PTY tab and captures session_id", function() {
+    expect(res.getStatus()).to.equal(200);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.session_id).to.be.a("string");
+    expect(parsed.state).to.equal("IDLE");
+  });
+}

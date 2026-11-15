@@ -1,0 +1,38 @@
+meta {
+  name: 02 - Auth Connect (Handshake + TUI Approval)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/auth/connect
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "agent_id": "{{agent_id}}",
+    "agent_name": "{{agent_name}}",
+    "workspace": "{{workspace}}"
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 200 && res.getBody() && res.getBody().access_token) {
+    bru.setEnvVar("access_token", res.getBody().access_token);
+  }
+}
+
+tests {
+  test("Handshake approved in TUI and access_token issued", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().access_token).to.be.a("string");
+    expect(res.getBody().token_type).to.equal("Bearer");
+    expect(res.getBody().agent_id).to.equal(bru.getEnvVar("agent_id"));
+  });
+}

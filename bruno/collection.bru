@@ -1,0 +1,12 @@
+docs {
+  # Tether MCP Side-Car — Colección de Validación Manual
+
+  Flujo recomendado de prueba con `./tether` corriendo en una terminal:
+  1. Selecciona el entorno **local** en la esquina superior derecha de Bruno.
+  2. Ejecuta `01-healthz` para verificar que el servidor HTTP responde en `127.0.0.1:7432`.
+  3. Ejecuta `02-auth-connect`: verás emerger el **Modal Flotante de Consentimiento** en la TUI de `tether`. Pulsa `a` (Aprobar 1x) o `s` (Aprobar en sesión). El script post-respuesta guardará automáticamente `access_token` en el entorno de Bruno.
+  4. Ejecuta `03-mcp-initialize`, `04-resource-env-system` y `05-resource-sessions`.
+  5. Ejecuta `06-tool-session-open` para abrir una nueva pestaña PTY real en la TUI (guarda automáticamente `session_id`).
+  6. Ejecuta `07` (comando seguro read-only), `08` (comando que solicita aprobación en la TUI) y `09` (intento de escape `..` bloqueado por el Command Guard con `403`).
+  7. Ejecuta `10-tool-session-input`, `11-tool-session-screen` y `12-tool-session-close`.
+}

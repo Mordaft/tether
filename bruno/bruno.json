@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "Tether MCP Side-Car",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}

@@ -1,0 +1,42 @@
+meta {
+  name: 03 - MCP Initialize
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-03-26",
+      "capabilities": {},
+      "clientInfo": {
+        "name": "bruno-manual-validator",
+        "version": "1.0.0"
+      }
+    }
+  }
+}
+
+tests {
+  test("MCP Initialize returns serverInfo tether", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().result.serverInfo.name).to.equal("tether");
+  });
+}

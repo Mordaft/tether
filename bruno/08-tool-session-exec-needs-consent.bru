@@ -1,0 +1,43 @@
+meta {
+  name: 08 - Tool session_exec (Requires Human Consent in TUI)
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "tools/call",
+    "params": {
+      "name": "session_exec",
+      "arguments": {
+        "session_id": "{{session_id}}",
+        "command": "go test ./internal/guard",
+        "timeout_ms": 30000
+      }
+    }
+  }
+}
+
+tests {
+  test("Executes after human approves in TUI floating modal ([a] or [s])", function() {
+    expect(res.getStatus()).to.equal(200);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.exit_code).to.equal(0);
+  });
+}

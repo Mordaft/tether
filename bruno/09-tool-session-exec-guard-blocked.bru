@@ -1,0 +1,44 @@
+meta {
+  name: 09 - Tool session_exec (Command Guard AST Rejects Path Traversal)
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "tools/call",
+    "params": {
+      "name": "session_exec",
+      "arguments": {
+        "session_id": "{{session_id}}",
+        "command": "cat ../secret_outside_workspace.txt"
+      }
+    }
+  }
+}
+
+tests {
+  test("Command Guard blocks '..' path traversal with 403 PATH_TRAVERSAL", function() {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().result.isError).to.equal(true);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.http_status).to.equal(403);
+    expect(parsed.violation).to.equal("PATH_TRAVERSAL");
+  });
+}

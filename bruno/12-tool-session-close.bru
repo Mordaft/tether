@@ -1,0 +1,42 @@
+meta {
+  name: 12 - Tool session_close
+  type: http
+  seq: 12
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 10,
+    "method": "tools/call",
+    "params": {
+      "name": "session_close",
+      "arguments": {
+        "session_id": "{{session_id}}"
+      }
+    }
+  }
+}
+
+tests {
+  test("Closes PTY session and terminates process tree", function() {
+    expect(res.getStatus()).to.equal(200);
+    const parsed = JSON.parse(res.getBody().result.content[0].text);
+    expect(parsed.closed).to.equal(true);
+    expect(parsed.state).to.equal("CLOSED");
+  });
+}
