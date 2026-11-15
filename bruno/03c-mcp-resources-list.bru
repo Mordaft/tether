@@ -1,0 +1,37 @@
+meta {
+  name: 03c - MCP Discover Resources (resources/list)
+  type: http
+  seq: 3.2
+}
+
+post {
+  url: {{base_url}}/mcp
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "jsonrpc": "2.0",
+    "id": 102,
+    "method": "resources/list",
+    "params": {}
+  }
+}
+
+tests {
+  test("Discovers published MCP resources (tether://env/system and tether://sessions)", function() {
+    expect(res.getStatus()).to.equal(200);
+    const resources = res.getBody().result.resources;
+    expect(resources).to.be.an("array");
+    expect(resources.length).to.equal(2);
+  });
+}

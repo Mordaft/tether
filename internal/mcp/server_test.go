@@ -77,6 +77,23 @@ func TestMCPServer_EndToEndToolsAndResources(t *testing.T) {
 		"clientInfo":      map[string]any{"name": "test-client", "version": "1.0.0"},
 	})
 
+	// 3b. Discover published tools via tools/list and resources via resources/list
+	toolsList := callRPC("tools/list", map[string]any{})
+	toolsBytes, _ := json.Marshal(toolsList)
+	for _, toolName := range []string{ToolSessionOpen, ToolSessionExec, ToolSessionInput, ToolSessionScreen, ToolSessionClose} {
+		if !strings.Contains(string(toolsBytes), toolName) {
+			t.Fatalf("expected tools/list to publish %s, got %s", toolName, string(toolsBytes))
+		}
+	}
+
+	resList := callRPC("resources/list", map[string]any{})
+	resBytes, _ := json.Marshal(resList)
+	for _, resURI := range []string{ResourceSystemURI, ResourceSessionsURI} {
+		if !strings.Contains(string(resBytes), resURI) {
+			t.Fatalf("expected resources/list to publish %s, got %s", resURI, string(resBytes))
+		}
+	}
+
 	// 4. Read tether://env/system resource
 	sysRes := callRPC("resources/read", map[string]any{
 		"uri": ResourceSystemURI,

@@ -1,0 +1,29 @@
+meta {
+  name: 13 - MCP SSE Endpoint (GET /sse)
+  type: http
+  seq: 13
+}
+
+get {
+  url: {{base_url}}/sse
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  Accept: text/event-stream
+}
+
+docs {
+  Abre el stream Server-Sent Events (`GET /sse`).
+  El servidor emite inmediatamente el evento inicial:
+  ```
+  event: endpoint
+  data: /message?sessionId=<uuid>
+  ```
+  Nota: Como `/sse` es un stream persistente (`keep-alive`), en clientes REST como Bruno quedará escuchando hasta que canceles la petición, mientras que en `curl -N` verás los eventos SSE en tiempo real.
+}
