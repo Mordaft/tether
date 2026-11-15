@@ -117,6 +117,17 @@ type Manager struct {
 	eventBus    *bus.EventBus
 	idleTimeout time.Duration
 	seq         atomic.Uint64
+	dirtyFlag   atomic.Bool
+}
+
+// ConsumeDirty atomically checks and resets the dirty flag used by the 60 FPS TUI render loop.
+func (m *Manager) ConsumeDirty() bool {
+	return m.dirtyFlag.Swap(false)
+}
+
+// MarkDirty marks the PTY manager state as dirty for the next 60 FPS frame.
+func (m *Manager) MarkDirty() {
+	m.dirtyFlag.Store(true)
 }
 
 // NewManager creates a multi-tenant PTY session manager.
@@ -238,6 +249,7 @@ func (m *Manager) readLoop(ts *TerminalSession) {
 		if n > 0 {
 			chunk := string(buf[:n])
 			_, _ = ts.ring.Write(buf[:n])
+			m.dirtyFlag.Store(true)
 
 			now := time.Now()
 			var stateChanged bool
@@ -611,6 +623,26 @@ waitLoop:
 // to a session tab.
 func (m *Manager) WriteHumanInput(agentID AgentID, sessionID SessionID, text string, pressEnter bool) error {
 	_, _, err := m.SendInput(agentID, sessionID, text, pressEnter)
+	return err
+}
+
+// WriteRaw writes raw keystroke bytes directly to the PTY without blocking,
+// used in Neovim-style TERMINAL/INSERT mode.
+func (m *Manager) WriteRaw(agentID AgentID, sessionID SessionID, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	ts, err := m.lookupSession(agentID, sessionID)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-ts.closedCh:
+		return ErrSessionClosed
+	default:
+	}
+	_, err = ts.ptmx.Write(data)
+	m.dirtyFlag.Store(true)
 	return err
 }
 

@@ -27,6 +27,7 @@ func main() {
 	port := flag.Int("port", 7432, "Fixed HTTP/SSE port for the tether server")
 	ttl := flag.Duration("ttl", 30*time.Minute, "Access token TTL duration (e.g. 30m, 1h)")
 	idleTimeout := flag.Duration("idle-timeout", 3*time.Second, "Duration without PTY output before reporting WAITING_FOR_INPUT")
+	noIcons := flag.Bool("no-icons", false, "Disable Nerd Fonts v3 icons and use ASCII labels ([AG], [DIR], [SH], etc.)")
 	headless := flag.Bool("headless", false, "Run without interactive TUI (auto-approves requests; for testing only)")
 	flag.Parse()
 
@@ -67,7 +68,7 @@ func main() {
 		return
 	}
 
-	tuiModel := tui.NewModel(listenAddr, sysInfo, eventBus, authMgr, ptyMgr)
+	tuiModel := tui.NewModel(listenAddr, sysInfo, eventBus, authMgr, ptyMgr, tui.WithNoIcons(*noIcons))
 	defer tuiModel.Close()
 
 	prog := tea.NewProgram(tuiModel, tea.WithAltScreen())

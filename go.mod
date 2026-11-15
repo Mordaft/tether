@@ -3,17 +3,19 @@ module tether
 go 1.26.1
 
 require (
+	github.com/alecthomas/chroma/v2 v2.27.0
+	github.com/atotto/clipboard v0.1.4
 	github.com/aymanbagabas/go-pty v0.2.3
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/mark3labs/mcp-go v1.5.0
+	github.com/sahilm/fuzzy v0.1.3
 	golang.org/x/sys v0.47.0
 	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
-	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
 	github.com/charmbracelet/x/ansi v0.11.6 // indirect
@@ -23,6 +25,7 @@ require (
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.5.0 // indirect
 	github.com/creack/pty v1.1.24 // indirect
+	github.com/dlclark/regexp2/v2 v2.2.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect

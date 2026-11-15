@@ -3,10 +3,10 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -16,15 +16,35 @@ import (
 	"tether/internal/pty"
 )
 
+const FrameInterval60FPS = 16 * time.Millisecond
+
+// Mode represents the Vim-like modal state of the TUI.
+type Mode int
+
+const (
+	ModeNormal Mode = iota
+	ModeTerminal
+)
+
 // BusEventMsg wraps an internal bus.Event for the Bubbletea update loop.
 type BusEventMsg struct {
 	Event bus.Event
 }
 
-// TickMsg triggers periodic UI refreshes (e.g. token TTL / active agent counters).
-type TickMsg time.Time
+// FrameTickMsg drives the decoupled 60 FPS (~16ms) render loop.
+type FrameTickMsg time.Time
 
-// Model implements the Bubbletea TUI for Tether.
+// ModelOption configures optional settings on the TUI Model.
+type ModelOption func(*Model)
+
+// WithNoIcons enables ASCII icon fallback (--no-icons) for terminals without Nerd Fonts v3.
+func WithNoIcons(noIcons bool) ModelOption {
+	return func(m *Model) {
+		m.icons = NewIconSet(noIcons)
+	}
+}
+
+// Model implements the Neovim/LazyVim/Zellij-inspired Bubbletea TUI for Tether.
 type Model struct {
 	listenAddr  string
 	sysInfo     env.SystemInfo
@@ -34,36 +54,76 @@ type Model struct {
 	eventsCh    <-chan bus.Event
 	unsubscribe func()
 
+	icons  IconSet
+	styles Styles
+
 	width        int
 	height       int
+	mode         Mode
+	zenMode      bool
 	tabs         []bus.TerminalSession
 	activeTabIdx int
-	inputMode    bool // True when human operator toggled Ctrl+T to type directly into PTY
 
-	viewport  viewport.Model
-	textInput textinput.Model
-	eventLog  []string
+	// Virtualized viewport & in-buffer search
+	viewport          VirtualViewport
+	searchInput       textinput.Model
+	searchInputActive bool
+
+	// Leader key (Space) & 300ms Which-Key state
+	leaderPending         bool
+	leaderWhichKeyVisible bool
+	leaderSeq             uint64
+
+	// Double-Esc (`Esc Esc`) tracker for exiting ModeTerminal
+	lastEscAt time.Time
+
+	// Floating Window Overlays (Z-Index)
+	overlay          OverlayKind
+	consentCursor    int
+	consentDismissed bool
+	fuzzyInput       textinput.Model
+	fuzzyCursor      int
+	inspectLines     []string
+	inspectScroll    int
+
+	// Toast notifications
+	toastMessage string
+	toastSeq     uint64
+
+	// 60 FPS decoupled dirty flag & cached frame
+	dirty      atomic.Bool
+	cachedView string
+	lastSecond int64
 }
 
-// NewModel initializes the multi-tab Bubbletea TUI model connected to the EventBus.
+// NewModel initializes the multi-tab Neovim-grade Bubbletea TUI connected to the EventBus.
 func NewModel(
 	listenAddr string,
 	sysInfo env.SystemInfo,
 	eventBus *bus.EventBus,
 	authMgr *auth.Manager,
 	ptyMgr *pty.Manager,
+	opts ...ModelOption,
 ) *Model {
 	ch, unsub := eventBus.Subscribe(256)
 
-	ti := textinput.New()
-	ti.Placeholder = "Escribe comando/input para enviar a la PTY y pulsa Enter (Esc o Ctrl+T para salir)..."
-	ti.CharLimit = 1024
-	ti.Width = 80
+	searchTI := textinput.New()
+	searchTI.Placeholder = "buscar en buffer..."
+	searchTI.CharLimit = 256
+	searchTI.Width = 40
 
-	vp := viewport.New(100, 18)
-	vp.SetContent("Sin sesiones PTY activas. Esperando conexiones de agentes vía MCP...")
+	fuzzyTI := textinput.New()
+	fuzzyTI.Placeholder = "filtrar por agent_id, sesión, shell o estado..."
+	fuzzyTI.CharLimit = 256
+	fuzzyTI.Width = 48
 
-	return &Model{
+	vp := NewVirtualViewport(100, 24)
+	vp.SetLines([]string{
+		"Tether Side-Car Terminal Bridge — Listo.",
+		"Esperando conexiones de agentes vía MCP (POST /auth/connect)...",
+	})
+
+	m := &Model{
 		listenAddr:  listenAddr,
 		sysInfo:     sysInfo,
 		eventBus:    eventBus,
@@ -71,10 +131,24 @@ func NewModel(
 		ptyMgr:      ptyMgr,
 		eventsCh:    ch,
 		unsubscribe: unsub,
+		icons:       NewIconSet(false),
+		styles:      NewStyles(),
+		width:       100,
+		height:      30,
+		mode:        ModeNormal,
 		viewport:    vp,
-		textInput:   ti,
-		eventLog:    []string{fmt.Sprintf("[%s] Servidor tether activo en %s", time.Now().Format("15:04:05"), listenAddr)},
+		searchInput: searchTI,
+		fuzzyInput:  fuzzyTI,
 	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(m)
+		}
+	}
+
+	m.dirty.Store(true)
+	return m
 }
 
 // Close releases the EventBus subscription.
@@ -84,11 +158,11 @@ func (m *Model) Close() {
 	}
 }
 
-// Init starts listening to the EventBus channel and periodic refresh ticker.
+// Init starts the EventBus listener and the 60 FPS (~16ms) tick loop.
 func (m *Model) Init() tea.Cmd {
 	return tea.Batch(
 		waitForBusEvent(m.eventsCh),
-		tickEverySecond(),
+		tick60FPS(),
 	)
 }
 
@@ -102,158 +176,434 @@ func waitForBusEvent(ch <-chan bus.Event) tea.Cmd {
 	}
 }
 
-func tickEverySecond() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
-		return TickMsg(t)
+func tick60FPS() tea.Cmd {
+	return tea.Tick(FrameInterval60FPS, func(t time.Time) tea.Msg {
+		return FrameTickMsg(t)
 	})
 }
 
-// Update processes keyboard shortcuts, terminal resize events, and real-time EventBus messages.
+// Update drives the modal state machine, floating overlays, Leader key sequences, and 60 FPS refresh.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.recalculateLayout()
-		m.refreshViewportContent()
+		m.syncActiveBufferLines()
+		m.dirty.Store(true)
 		return m, nil
 
-	case TickMsg:
-		m.syncTabs()
-		return m, tickEverySecond()
+	case FrameTickMsg:
+		nowSec := time.Time(msg).Unix()
+		secChanged := nowSec != m.lastSecond
+		if secChanged {
+			m.lastSecond = nowSec
+		}
+		ptyDirty := m.ptyMgr != nil && m.ptyMgr.ConsumeDirty()
+		if ptyDirty || secChanged {
+			m.syncTabs()
+			m.syncActiveBufferLines()
+			m.dirty.Store(true)
+		}
+		return m, tick60FPS()
+
+	case WhichKeyTimeoutMsg:
+		if m.leaderPending && msg.Seq == m.leaderSeq {
+			m.leaderWhichKeyVisible = true
+			m.dirty.Store(true)
+		}
+		return m, nil
+
+	case ToastExpireMsg:
+		if msg.Seq == m.toastSeq {
+			m.toastMessage = ""
+			m.dirty.Store(true)
+		}
+		return m, nil
 
 	case BusEventMsg:
 		m.handleBusEvent(msg.Event)
-		cmds = append(cmds, waitForBusEvent(m.eventsCh))
-		return m, tea.Batch(cmds...)
+		m.dirty.Store(true)
+		return m, waitForBusEvent(m.eventsCh)
 
 	case tea.KeyMsg:
-		// If human operator is in Direct Terminal Input Mode (Ctrl+T)
-		if m.inputMode {
-			switch msg.String() {
-			case "ctrl+t", "esc":
-				m.inputMode = false
-				m.textInput.Blur()
-				return m, nil
-			case "ctrl+c":
-				if tab, ok := m.activeTab(); ok && m.ptyMgr != nil {
-					_ = m.ptyMgr.WriteHumanInput(tab.AgentID, tab.ID, "Ctrl+C", false)
-					m.appendLog(fmt.Sprintf("Señal Ctrl+C enviada por humano a %s", tab.Name))
-				}
-				return m, nil
-			case "enter":
-				val := m.textInput.Value()
-				m.textInput.SetValue("")
-				if tab, ok := m.activeTab(); ok && m.ptyMgr != nil {
-					_ = m.ptyMgr.WriteHumanInput(tab.AgentID, tab.ID, val, true)
-					m.appendLog(fmt.Sprintf("Input enviado a %s: %s", tab.Name, val))
-				}
-				return m, nil
-			default:
-				var tiCmd tea.Cmd
-				m.textInput, tiCmd = m.textInput.Update(msg)
-				return m, tiCmd
-			}
-		}
-
-		// Normal TUI Supervision Mode shortcuts
-		switch msg.String() {
-		case "ctrl+c", "q", "Q":
-			m.Close()
-			return m, tea.Quit
-
-		case "ctrl+t":
-			if _, ok := m.activeTab(); ok {
-				m.inputMode = true
-				m.textInput.Focus()
-				return m, textinput.Blink
-			}
-			return m, nil
-
-		case "tab", "right", "l":
-			if len(m.tabs) > 0 {
-				m.activeTabIdx = (m.activeTabIdx + 1) % len(m.tabs)
-				m.refreshViewportContent()
-			}
-			return m, nil
-
-		case "shift+tab", "left", "h":
-			if len(m.tabs) > 0 {
-				m.activeTabIdx = (m.activeTabIdx - 1 + len(m.tabs)) % len(m.tabs)
-				m.refreshViewportContent()
-			}
-			return m, nil
-
-		case "ctrl+x":
-			if tab, ok := m.activeTab(); ok && m.ptyMgr != nil {
-				_ = m.ptyMgr.CloseSession(tab.AgentID, tab.ID)
-				m.appendLog(fmt.Sprintf("Pestaña cerrada por humano: %s", tab.Name))
-				m.syncTabs()
-				m.refreshViewportContent()
-			}
-			return m, nil
-
-		case "a", "A":
-			if req, err := m.eventBus.ResolveNextConsent(bus.DecisionAllowOnce, "aprobado una vez desde TUI"); err == nil {
-				m.appendLog(fmt.Sprintf("[APROBADO 1x] %s (%s)", req.AgentID, req.Kind))
-			}
-			return m, nil
-
-		case "s", "S":
-			if req, err := m.eventBus.ResolveNextConsent(bus.DecisionAllowSession, "aprobado para la sesión desde TUI"); err == nil {
-				m.appendLog(fmt.Sprintf("[APROBADO SESIÓN] %s (%s)", req.AgentID, req.Kind))
-			}
-			return m, nil
-
-		case "d", "D":
-			if req, err := m.eventBus.ResolveNextConsent(bus.DecisionDeny, "denegado desde TUI"); err == nil {
-				m.appendLog(fmt.Sprintf("[DENEGADO] %s (%s)", req.AgentID, req.Kind))
-			}
-			return m, nil
-		}
-
-		var vpCmd tea.Cmd
-		m.viewport, vpCmd = m.viewport.Update(msg)
-		return m, vpCmd
+		m.dirty.Store(true)
+		return m.handleKeyMsg(msg)
 	}
 
 	return m, nil
 }
 
-func (m *Model) handleBusEvent(evt bus.Event) {
-	ts := evt.Timestamp.Format("15:04:05")
-	switch evt.Type {
-	case bus.EventConsentQueued:
-		if evt.ConsentRequest != nil {
-			if evt.ConsentRequest.Kind == bus.ConsentKindConnect {
-				m.appendLog(fmt.Sprintf("[%s] Solicitud conexión: %s -> %s", ts, evt.ConsentRequest.AgentID, evt.ConsentRequest.Workspace))
-			} else {
-				m.appendLog(fmt.Sprintf("[%s] Solicitud comando (%s): %s", ts, evt.ConsentRequest.AgentID, evt.ConsentRequest.Command))
+func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// 1. TERMINAL / INSERT Mode: Forward raw bytes directly to PTY; double Esc (`Esc Esc`) returns to NORMAL.
+	if m.mode == ModeTerminal {
+		if msg.Type == tea.KeyEsc {
+			now := time.Now()
+			if !m.lastEscAt.IsZero() && now.Sub(m.lastEscAt) <= DoubleEscThreshold {
+				m.mode = ModeNormal
+				m.lastEscAt = time.Time{}
+				cmd := m.showToast("Modo NORMAL")
+				return m, cmd
+			}
+			m.lastEscAt = now
+			if tab, ok := m.activeTab(); ok && m.ptyMgr != nil {
+				_ = m.ptyMgr.WriteRaw(tab.AgentID, tab.ID, []byte{0x1b})
+			}
+			return m, nil
+		}
+
+		m.lastEscAt = time.Time{}
+		if tab, ok := m.activeTab(); ok && m.ptyMgr != nil {
+			if raw := KeyMsgToRawBytes(msg); len(raw) > 0 {
+				_ = m.ptyMgr.WriteRaw(tab.AgentID, tab.ID, raw)
 			}
 		}
-	case bus.EventAgentConnected:
-		if evt.AgentSession != nil {
-			m.appendLog(fmt.Sprintf("[%s] Agente conectado: %s (%s)", ts, evt.AgentSession.AgentID, evt.AgentSession.WorkspaceRoot))
+		return m, nil
+	}
+
+	// 2. Search Input Prompt (`/`) in NORMAL mode
+	if m.searchInputActive {
+		switch msg.Type {
+		case tea.KeyEsc:
+			m.searchInputActive = false
+			m.searchInput.Blur()
+			return m, nil
+		case tea.KeyEnter:
+			m.searchInputActive = false
+			m.searchInput.Blur()
+			q := m.searchInput.Value()
+			m.viewport.SetSearchQuery(q)
+			if len(m.viewport.MatchLines) > 0 {
+				return m, m.showToast(fmt.Sprintf("/%s (%d coincidencias)", q, len(m.viewport.MatchLines)))
+			}
+			return m, m.showToast(fmt.Sprintf("Patrón no encontrado: %s", q))
+		default:
+			var cmd tea.Cmd
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			return m, cmd
 		}
-	case bus.EventAgentExpired:
-		if evt.AgentSession != nil {
-			m.appendLog(fmt.Sprintf("[%s] Token expirado: %s", ts, evt.AgentSession.AgentID))
+	}
+
+	// 3. Leader Key Sequence (`Space + <key>`)
+	if m.leaderPending {
+		m.leaderPending = false
+		m.leaderWhichKeyVisible = false
+		return m.handleLeaderFollowKey(msg)
+	}
+
+	// 4. Active Floating Overlay Handling
+	switch m.effectiveOverlay() {
+	case OverlayFuzzySwitcher:
+		return m.handleFuzzyOverlayKey(msg)
+	case OverlayInspectOutput:
+		return m.handleInspectOverlayKey(msg)
+	case OverlayWorkspaces:
+		switch msg.String() {
+		case "esc", "q", "enter":
+			m.overlay = OverlayNone
 		}
+		return m, nil
+	case OverlayKillConfirm:
+		return m.handleKillConfirmKey(msg)
+	case OverlayConsent:
+		if handled, cmd := m.handleConsentModalKey(msg); handled {
+			return m, cmd
+		}
+	}
+
+	// 5. Standard Vim NORMAL Mode Keybindings
+	switch msg.String() {
+	case "ctrl+c", "q", "Q":
+		m.Close()
+		return m, tea.Quit
+
+	case " ":
+		m.leaderPending = true
+		m.leaderWhichKeyVisible = false
+		m.leaderSeq++
+		return m, scheduleWhichKeyTimer(m.leaderSeq)
+
+	case "i", "enter", "ctrl+t":
+		if _, ok := m.activeTab(); ok {
+			m.mode = ModeTerminal
+			m.lastEscAt = time.Time{}
+			return m, m.showToast("Modo TERMINAL (pulsa Esc Esc para volver a NORMAL)")
+		}
+		return m, nil
+
+	case "h", "[", "shift+tab", "left":
+		if len(m.tabs) > 0 {
+			m.activeTabIdx = (m.activeTabIdx - 1 + len(m.tabs)) % len(m.tabs)
+			m.viewport.AutoScroll = true
+			m.syncActiveBufferLines()
+		}
+		return m, nil
+
+	case "l", "]", "tab", "right":
+		if len(m.tabs) > 0 {
+			m.activeTabIdx = (m.activeTabIdx + 1) % len(m.tabs)
+			m.viewport.AutoScroll = true
+			m.syncActiveBufferLines()
+		}
+		return m, nil
+
+	case "j", "down":
+		m.viewport.ScrollDown(1)
+		return m, nil
+
+	case "k", "up":
+		m.viewport.ScrollUp(1)
+		return m, nil
+
+	case "ctrl+d":
+		m.viewport.ScrollDown(m.viewport.Height / 2)
+		return m, nil
+
+	case "ctrl+u":
+		m.viewport.ScrollUp(m.viewport.Height / 2)
+		return m, nil
+
+	case "g":
+		m.viewport.GotoTop()
+		return m, m.showToast("Top of buffer (Auto-scroll pausado)")
+
+	case "G":
+		m.viewport.GotoBottom()
+		return m, m.showToast("Bottom of buffer (Auto-scroll activo)")
+
+	case "/":
+		m.searchInputActive = true
+		m.searchInput.SetValue("")
+		m.searchInput.Focus()
+		return m, textinput.Blink
+
+	case "n":
+		if m.viewport.NextMatch() {
+			return m, m.showToast(fmt.Sprintf("Match %d/%d", m.viewport.CurrentMatch+1, len(m.viewport.MatchLines)))
+		}
+		return m, nil
+
+	case "N":
+		if m.viewport.PrevMatch() {
+			return m, m.showToast(fmt.Sprintf("Match %d/%d", m.viewport.CurrentMatch+1, len(m.viewport.MatchLines)))
+		}
+		return m, nil
+
+	case "y":
+		var activeCmd string
+		if tab, ok := m.activeTab(); ok {
+			activeCmd = tab.ActiveCommand
+		}
+		count, err := m.viewport.YankLatestBlock(activeCmd)
+		if err != nil {
+			return m, m.showToast(err.Error())
+		}
+		return m, m.showToast(fmt.Sprintf("Yank: %d líneas copiadas al portapapeles", count))
+
+	case "a", "A":
+		return m, m.resolveSelectedConsent(bus.DecisionAllowOnce, "Aprobado 1x")
+
+	case "s", "S":
+		return m, m.resolveSelectedConsent(bus.DecisionAllowSession, "Aprobado en sesión")
+
+	case "d", "D":
+		return m, m.resolveSelectedConsent(bus.DecisionDeny, "Denegado")
+	}
+
+	return m, nil
+}
+
+func (m *Model) handleLeaderFollowKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case " ", "t":
+		m.overlay = OverlayFuzzySwitcher
+		m.fuzzyInput.SetValue("")
+		m.fuzzyCursor = 0
+		m.fuzzyInput.Focus()
+		return m, textinput.Blink
+
+	case "a":
+		if m.overlay == OverlayConsent {
+			m.overlay = OverlayNone
+			m.consentDismissed = true
+		} else {
+			m.consentDismissed = false
+			m.overlay = OverlayConsent
+		}
+		return m, nil
+
+	case "o":
+		m.syncActiveBufferLines()
+		m.inspectLines = append([]string(nil), m.viewport.Lines...)
+		m.inspectScroll = m.viewport.TopLine
+		m.overlay = OverlayInspectOutput
+		return m, nil
+
+	case "w":
+		m.overlay = OverlayWorkspaces
+		return m, nil
+
+	case "z":
+		m.zenMode = !m.zenMode
+		m.recalculateLayout()
+		if m.zenMode {
+			return m, m.showToast("Zen Mode: ON")
+		}
+		return m, m.showToast("Zen Mode: OFF")
+
+	case "k":
+		if _, ok := m.activeTab(); ok {
+			m.overlay = OverlayKillConfirm
+		} else {
+			return m, m.showToast("Sin pestaña activa para terminar")
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *Model) handleConsentModalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
+	pending := m.eventBus.PendingConsents()
+	if len(pending) == 0 {
+		m.overlay = OverlayNone
+		return false, nil
+	}
+
+	switch msg.String() {
+	case "a", "A":
+		return true, m.resolveSelectedConsent(bus.DecisionAllowOnce, "Aprobado 1x")
+	case "s", "S":
+		return true, m.resolveSelectedConsent(bus.DecisionAllowSession, "Aprobado en sesión")
+	case "d", "D":
+		return true, m.resolveSelectedConsent(bus.DecisionDeny, "Denegado")
+	case "tab":
+		m.consentCursor = (m.consentCursor + 1) % len(pending)
+		return true, nil
+	case "shift+tab":
+		m.consentCursor = (m.consentCursor - 1 + len(pending)) % len(pending)
+		return true, nil
+	case "esc":
+		m.overlay = OverlayNone
+		m.consentDismissed = true
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *Model) resolveSelectedConsent(decision bus.ConsentDecision, label string) tea.Cmd {
+	pending := m.eventBus.PendingConsents()
+	if len(pending) == 0 {
+		return nil
+	}
+	if m.consentCursor >= len(pending) {
+		m.consentCursor = 0
+	}
+	target := pending[m.consentCursor]
+	if err := m.eventBus.ResolveConsent(target.ID, decision, label); err != nil {
+		return nil
+	}
+	if len(m.eventBus.PendingConsents()) == 0 && m.overlay == OverlayConsent {
+		m.overlay = OverlayNone
+	}
+	return m.showToast(fmt.Sprintf("%s: %s", label, target.AgentID))
+}
+
+func (m *Model) handleFuzzyOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	filtered := m.filteredFuzzyTabs()
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.fuzzyInput.Blur()
+		m.overlay = OverlayNone
+		return m, nil
+	case tea.KeyUp, tea.KeyCtrlP:
+		if len(filtered) > 0 {
+			m.fuzzyCursor = (m.fuzzyCursor - 1 + len(filtered)) % len(filtered)
+		}
+		return m, nil
+	case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
+		if len(filtered) > 0 {
+			m.fuzzyCursor = (m.fuzzyCursor + 1) % len(filtered)
+		}
+		return m, nil
+	case tea.KeyEnter:
+		if len(filtered) > 0 {
+			if m.fuzzyCursor >= len(filtered) {
+				m.fuzzyCursor = 0
+			}
+			m.activeTabIdx = filtered[m.fuzzyCursor].index
+			m.viewport.AutoScroll = true
+			m.syncActiveBufferLines()
+		}
+		m.fuzzyInput.Blur()
+		m.overlay = OverlayNone
+		return m, nil
+	default:
+		var cmd tea.Cmd
+		m.fuzzyInput, cmd = m.fuzzyInput.Update(msg)
+		m.fuzzyCursor = 0
+		return m, cmd
+	}
+}
+
+func (m *Model) handleInspectOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.overlay = OverlayNone
+	case "j", "down":
+		if m.inspectScroll+1 < len(m.inspectLines) {
+			m.inspectScroll++
+		}
+	case "k", "up":
+		if m.inspectScroll > 0 {
+			m.inspectScroll--
+		}
+	case "ctrl+d":
+		m.inspectScroll += 10
+		if m.inspectScroll >= len(m.inspectLines) {
+			m.inspectScroll = max(0, len(m.inspectLines)-1)
+		}
+	case "ctrl+u":
+		m.inspectScroll = max(0, m.inspectScroll-10)
+	case "g":
+		m.inspectScroll = 0
+	case "G":
+		m.inspectScroll = max(0, len(m.inspectLines)-10)
+	case "y":
+		count, _ := m.viewport.YankLatestBlock("")
+		return m, m.showToast(fmt.Sprintf("Yank: %d líneas copiadas", count))
+	}
+	return m, nil
+}
+
+func (m *Model) handleKillConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y", "enter":
+		m.overlay = OverlayNone
+		if tab, ok := m.activeTab(); ok && m.ptyMgr != nil {
+			_ = m.ptyMgr.CloseSession(tab.AgentID, tab.ID)
+			m.syncTabs()
+			m.syncActiveBufferLines()
+			return m, m.showToast(fmt.Sprintf("Proceso terminado: %s", tab.Name))
+		}
+	case "n", "N", "esc", "q":
+		m.overlay = OverlayNone
+	}
+	return m, nil
+}
+
+func (m *Model) handleBusEvent(evt bus.Event) {
+	switch evt.Type {
+	case bus.EventConsentQueued:
+		m.consentDismissed = false
 	case bus.EventSessionOpened:
 		m.syncTabs()
 		if evt.TerminalSession != nil {
 			m.selectTabByID(evt.TerminalSession.ID)
-			m.appendLog(fmt.Sprintf("[%s] Nueva PTY: %s", ts, evt.TerminalSession.Name))
 		}
-		m.refreshViewportContent()
-	case bus.EventSessionUpdated, bus.EventSessionOutput:
+		m.syncActiveBufferLines()
+	case bus.EventSessionUpdated, bus.EventSessionOutput, bus.EventSessionClosed:
 		m.syncTabs()
-		m.refreshViewportContent()
-	case bus.EventSessionClosed:
-		m.syncTabs()
-		m.refreshViewportContent()
+		m.syncActiveBufferLines()
 	}
 }
 
@@ -261,11 +611,10 @@ func (m *Model) syncTabs() {
 	if m.ptyMgr == nil {
 		return
 	}
-	all := m.ptyMgr.AllSessions()
-	m.tabs = all
+	m.tabs = m.ptyMgr.AllSessions()
 	if len(m.tabs) == 0 {
 		m.activeTabIdx = 0
-		m.inputMode = false
+		m.mode = ModeNormal
 		return
 	}
 	if m.activeTabIdx >= len(m.tabs) {
@@ -289,18 +638,24 @@ func (m *Model) activeTab() (bus.TerminalSession, bool) {
 	return m.tabs[m.activeTabIdx], true
 }
 
-func (m *Model) refreshViewportContent() {
+func (m *Model) syncActiveBufferLines() {
 	tab, ok := m.activeTab()
 	if !ok || m.ptyMgr == nil {
-		m.viewport.SetContent("Sin sesiones PTY activas.\nLos agentes conectados pueden abrir pestañas mediante la tool MCP `session_open`.")
+		m.viewport.SetLines([]string{
+			fmt.Sprintf("Tether Side-Car Server (%s) — Sin sesiones PTY activas.", m.listenAddr),
+			"Los agentes conectados pueden abrir terminales mediante la tool MCP `session_open`.",
+		})
 		return
 	}
-	screen := m.ptyMgr.RawScreenForTUI(tab.AgentID, tab.ID)
-	if strings.TrimSpace(screen) == "" {
-		screen = fmt.Sprintf("(Sesión %s iniciada en %s — esperando comandos...)", tab.Name, tab.WorkspaceRoot)
+	raw := m.ptyMgr.RawScreenForTUI(tab.AgentID, tab.ID)
+	if strings.TrimSpace(raw) == "" {
+		m.viewport.SetLines([]string{
+			fmt.Sprintf("Sesión %s activa en %s (CWD: %s)", tab.Name, tab.WorkspaceRoot, tab.RelCWD),
+		})
+		return
 	}
-	m.viewport.SetContent(screen)
-	m.viewport.GotoBottom()
+	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	m.viewport.SetLines(lines)
 }
 
 func (m *Model) recalculateLayout() {
@@ -312,205 +667,41 @@ func (m *Model) recalculateLayout() {
 	if h <= 0 {
 		h = 30
 	}
-	vpHeight := h - 14
-	if vpHeight < 6 {
-		vpHeight = 6
+	vpHeight := h - 2 // 1 line TopTabBar + 1 line BottomStatusline -> 95% central viewport
+	if m.zenMode {
+		vpHeight = h
 	}
-	m.viewport.Width = w - 4
-	m.viewport.Height = vpHeight
-	m.textInput.Width = w - 18
+	if vpHeight < 4 {
+		vpHeight = 4
+	}
+	m.viewport.SetSize(w, vpHeight)
 }
 
-func (m *Model) appendLog(entry string) {
-	m.eventLog = append(m.eventLog, entry)
-	if len(m.eventLog) > 5 {
-		m.eventLog = m.eventLog[len(m.eventLog)-5:]
-	}
+func (m *Model) showToast(msg string) tea.Cmd {
+	m.toastSeq++
+	m.toastMessage = msg
+	return scheduleToastClear(m.toastSeq, 2500*time.Millisecond)
 }
 
-// View renders the 3-zone TUI interface:
-// 1. Header (Server status, OS/Shells, Connected Agents)
-// 2. Main Multi-Tab Terminal Area (Agent PTY tabs, live output viewport, Ctrl+T intervention bar)
-// 3. Bottom Common Panel (FIFO Consent Queue + Quick Shortcuts + Event Log)
+// View renders the cached 60 FPS frame or recomputes it when the dirty flag is set.
 func (m *Model) View() string {
-	return fmt.Sprintf(
-		"%s\n%s\n%s",
-		m.renderHeader(),
-		m.renderMainArea(),
-		m.renderConsentPanel(),
-	)
+	if m.dirty.Swap(false) || m.cachedView == "" {
+		m.cachedView = m.composeFrame()
+	}
+	return m.cachedView
 }
 
-func (m *Model) renderHeader() string {
-	headerStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#FAFAFA")).
-		Background(lipgloss.Color("#1E293B")).
-		Padding(0, 1)
+func (m *Model) composeFrame() string {
+	dimBg := m.effectiveOverlay() != OverlayNone
+	centerCanvas := m.viewport.RenderVirtualized(m.styles, dimBg)
+	centerWithOverlay := m.RenderActiveOverlay(centerCanvas)
 
-	badgeOnline := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#10B981")).
-		Render("● ONLINE")
-
-	shellNames := make([]string, 0, len(m.sysInfo.Shells))
-	for _, s := range m.sysInfo.Shells {
-		shellNames = append(shellNames, s.Name)
-	}
-	shellsStr := strings.Join(shellNames, ", ")
-	if shellsStr == "" {
-		shellsStr = "none"
+	if m.zenMode {
+		return lipgloss.NewStyle().Background(BgBase).Render(centerWithOverlay)
 	}
 
-	activeAgents := 0
-	if m.authMgr != nil {
-		activeAgents = len(m.authMgr.ActiveSessions())
-	}
+	topBar := m.RenderTopTabBar()
+	bottomBar := m.RenderBottomStatusline()
 
-	line := fmt.Sprintf(
-		"TETHER %s | %s | OS: %s/%s | Shells: [%s] | Agentes: %d | Pestañas PTY: %d",
-		badgeOnline,
-		m.listenAddr,
-		m.sysInfo.OS,
-		m.sysInfo.Arch,
-		shellsStr,
-		activeAgents,
-		len(m.tabs),
-	)
-	return headerStyle.Render(line)
-}
-
-func (m *Model) renderMainArea() string {
-	activeTabStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#0F172A")).
-		Background(lipgloss.Color("#38BDF8")).
-		Padding(0, 1)
-
-	inactiveTabStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#94A3B8")).
-		Background(lipgloss.Color("#1E293B")).
-		Padding(0, 1)
-
-	waitingTabStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#0F172A")).
-		Background(lipgloss.Color("#F59E0B")).
-		Padding(0, 1)
-
-	var tabRendered []string
-	for i, tab := range m.tabs {
-		stateBadge := "●"
-		switch tab.State {
-		case bus.StateRunning:
-			stateBadge = "⟳"
-		case bus.StateWaitingForInput:
-			stateBadge = "⚠ INPUT"
-		case bus.StateClosed:
-			stateBadge = "✕"
-		}
-		label := fmt.Sprintf("%s %s", stateBadge, tab.Name)
-		if i == m.activeTabIdx {
-			if tab.State == bus.StateWaitingForInput {
-				tabRendered = append(tabRendered, waitingTabStyle.Render(label))
-			} else {
-				tabRendered = append(tabRendered, activeTabStyle.Render(label))
-			}
-		} else {
-			tabRendered = append(tabRendered, inactiveTabStyle.Render(label))
-		}
-	}
-
-	tabBar := " [Sin pestañas activas]"
-	if len(tabRendered) > 0 {
-		tabBar = strings.Join(tabRendered, " ")
-	}
-
-	var metaLine string
-	if tab, ok := m.activeTab(); ok {
-		metaStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#CBD5E1"))
-		metaLine = metaStyle.Render(fmt.Sprintf(
-			" Agente: %s | Workspace: %s | CWD: %s | Estado: %s | Cmd: %s",
-			tab.AgentID,
-			tab.WorkspaceRoot,
-			tab.RelCWD,
-			tab.State,
-			 tab.ActiveCommand,
-		))
-	} else {
-		metaLine = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B")).Render(" Esperando apertura de sesión PTY...")
-	}
-
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#334155")).
-		Padding(0, 1)
-
-	inputBar := ""
-	if m.inputMode {
-		inputStyle := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#FDE047"))
-		inputBar = "\n" + inputStyle.Render("INTERVENCIÓN HUMANA > ") + m.textInput.View()
-	}
-
-	return fmt.Sprintf("%s\n%s\n%s%s", tabBar, metaLine, boxStyle.Render(m.viewport.View()), inputBar)
-}
-
-func (m *Model) renderConsentPanel() string {
-	pending := m.eventBus.PendingConsents()
-
-	panelBorderColor := lipgloss.Color("#475569")
-	if len(pending) > 0 {
-		panelBorderColor = lipgloss.Color("#F59E0B")
-	}
-
-	panelStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(panelBorderColor).
-		Padding(0, 1)
-
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F8FAFC"))
-	warnStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FBBF24"))
-	helpStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#94A3B8"))
-
-	var sb strings.Builder
-	sb.WriteString(titleStyle.Render(fmt.Sprintf("CENTRO DE CONSENTIMIENTOS Y EVENTOS (Cola FIFO: %d pendientes)", len(pending))))
-	sb.WriteString("\n")
-
-	if len(pending) > 0 {
-		head := pending[0]
-		if head.Kind == bus.ConsentKindConnect {
-			sb.WriteString(warnStyle.Render(fmt.Sprintf(
-				"▶ [CONEXIÓN AGENTE] %s (%s) solicita acceso a Workspace: %s",
-				head.AgentName,
-				head.AgentID,
-				head.Workspace,
-			)))
-		} else {
-			sb.WriteString(warnStyle.Render(fmt.Sprintf(
-				"▶ [EJECUCIÓN COMANDO] Agente: %s | Sesión: %s | CWD: %s | Comando: %s",
-				head.AgentID,
-				head.SessionID,
-				head.RelCWD,
-				head.Command,
-			)))
-		}
-		sb.WriteString("\n")
-		sb.WriteString(fmt.Sprintf("  Motivo: %s\n", head.Reason))
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#38BDF8")).Render(
-			"  Acción: [A]probar una vez   [S]esión (Permitir en esta sesión)   [D]enegar",
-		))
-	} else {
-		sb.WriteString(helpStyle.Render("✓ No hay solicitudes pendientes de aprobación humana."))
-		if len(m.eventLog) > 0 {
-			sb.WriteString("\n")
-			sb.WriteString(helpStyle.Render("Último evento: " + m.eventLog[len(m.eventLog)-1]))
-		}
-	}
-
-	sb.WriteString("\n")
-	sb.WriteString(helpStyle.Render("Atajos: [Tab/Shift+Tab] Cambiar pestaña | [Ctrl+T] Escribir en PTY | [Ctrl+X] Cerrar pestaña | [A]probar [S]esión [D]enegar | [Q] Salir"))
-
-	return panelStyle.Render(sb.String())
+	return fmt.Sprintf("%s\n%s\n%s", topBar, centerWithOverlay, bottomBar)
 }
