@@ -296,6 +296,11 @@ func (m *Manager) ActiveSessions() []*AgentSession {
 // HandleConnect implements the POST /auth/connect handshake endpoint.
 // It blocks awaiting human approval on the TUI consent queue before issuing an access token.
 func (m *Manager) HandleConnect(w http.ResponseWriter, r *http.Request) {
+	SetCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed; use POST /auth/connect")
 		return
@@ -394,7 +399,13 @@ func (m *Manager) HandleConnect(w http.ResponseWriter, r *http.Request) {
 // HTTP/SSE requests, enforces signature and TTL, and injects AgentSession into context.Context.
 func (m *Manager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rawToken, ok := extractBearerToken(r.Header.Get("Authorization"))
+		SetCORSHeaders(w, r)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		rawToken, ok := extractRequestToken(r)
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="tether"`)
 			writeJSONError(w, http.StatusUnauthorized, ErrMissingToken.Error())
@@ -411,6 +422,64 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 		ctx := WithSession(r.Context(), session)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+const (
+	defaultAllowedMethods = "GET, POST, PUT, DELETE, OPTIONS"
+	defaultAllowedHeaders = "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, Cache-Control, X-Requested-With"
+	defaultExposedHeaders = "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate, Content-Type"
+)
+
+// SetCORSHeaders applies Cross-Origin Resource Sharing (CORS) and Private Network Access (PNA)
+// headers so browser-based agents hosted on HTTPS origins (e.g. GitHub Pages) can communicate
+// with the local loopback tether server (http://127.0.0.1:7432).
+func SetCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" {
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Credentials", "true")
+		h.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network")
+	} else {
+		h.Set("Access-Control-Allow-Origin", "*")
+	}
+
+	h.Set("Access-Control-Allow-Methods", defaultAllowedMethods)
+
+	allowHeaders := defaultAllowedHeaders
+	if reqHeaders := strings.TrimSpace(r.Header.Get("Access-Control-Request-Headers")); reqHeaders != "" {
+		allowHeaders = allowHeaders + ", " + reqHeaders
+	}
+	h.Set("Access-Control-Allow-Headers", allowHeaders)
+	h.Set("Access-Control-Expose-Headers", defaultExposedHeaders)
+	h.Set("Access-Control-Allow-Private-Network", "true")
+	h.Set("Access-Control-Max-Age", "86400")
+}
+
+// CORSMiddleware wraps an http.Handler with CORS and Private Network Access headers,
+// and short-circuits HTTP OPTIONS preflight requests with 204 No Content.
+func CORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		SetCORSHeaders(w, r)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func extractRequestToken(r *http.Request) (string, bool) {
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		return tok, true
+	}
+	if q := strings.TrimSpace(r.URL.Query().Get("access_token")); q != "" {
+		return q, true
+	}
+	if q := strings.TrimSpace(r.URL.Query().Get("token")); q != "" {
+		return q, true
+	}
+	return "", false
 }
 
 func (m *Manager) computeHMAC(payload string) []byte {

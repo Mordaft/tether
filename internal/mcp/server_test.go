@@ -32,12 +32,35 @@ func TestMCPServer_EndToEndToolsAndResources(t *testing.T) {
 
 	handler := mcpSrv.Handler()
 
-	// 1. Unauthenticated request to /mcp must return 401
+	// 1. Unauthenticated request to /mcp must return 401 with CORS headers
 	unauthReq := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	unauthReq.Header.Set("Origin", "https://mordaft.github.io")
 	unauthRec := httptest.NewRecorder()
 	handler.ServeHTTP(unauthRec, unauthReq)
 	if unauthRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized on unauthenticated /mcp request, got %d", unauthRec.Code)
+	}
+	if got := unauthRec.Header().Get("Access-Control-Allow-Origin"); got != "https://mordaft.github.io" {
+		t.Fatalf("expected CORS Access-Control-Allow-Origin on 401 /mcp response, got %q", got)
+	}
+	if got := unauthRec.Header().Get("Access-Control-Allow-Private-Network"); got != "true" {
+		t.Fatalf("expected Access-Control-Allow-Private-Network=true on /mcp response, got %q", got)
+	}
+
+	// 1b. OPTIONS preflight on /, /mcp, /sse, /auth/connect must return 204 No Content with CORS + PNA headers
+	for _, p := range []string{"/", "/mcp", "/sse", "/auth/connect"} {
+		preReq := httptest.NewRequest(http.MethodOptions, p, nil)
+		preReq.Header.Set("Origin", "https://mordaft.github.io")
+		preReq.Header.Set("Access-Control-Request-Method", "POST")
+		preReq.Header.Set("Access-Control-Request-Private-Network", "true")
+		preRec := httptest.NewRecorder()
+		handler.ServeHTTP(preRec, preReq)
+		if preRec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 No Content on OPTIONS %s, got %d", p, preRec.Code)
+		}
+		if got := preRec.Header().Get("Access-Control-Allow-Origin"); got != "https://mordaft.github.io" {
+			t.Fatalf("expected Access-Control-Allow-Origin on OPTIONS %s, got %q", p, got)
+		}
 	}
 
 	// 2. Issue token for agent-mcp-01
@@ -70,12 +93,24 @@ func TestMCPServer_EndToEndToolsAndResources(t *testing.T) {
 		return out
 	}
 
-	// 3. Initialize MCP session
+	// 3. Initialize MCP session (both on /mcp and on root /)
 	_ = callRPC("initialize", map[string]any{
 		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "test-client", "version": "1.0.0"},
 	})
+	rootInitReq := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"root-client","version":"1.0.0"}}}`))
+	rootInitReq.Header.Set("Content-Type", "application/json")
+	rootInitReq.Header.Set("Authorization", "Bearer "+agentSess.AccessToken)
+	rootInitReq.Header.Set("Origin", "https://mordaft.github.io")
+	rootInitRec := httptest.NewRecorder()
+	handler.ServeHTTP(rootInitRec, rootInitReq)
+	if rootInitRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on root POST / initialize, got %d: %s", rootInitRec.Code, rootInitRec.Body.String())
+	}
+	if got := rootInitRec.Header().Get("Access-Control-Allow-Origin"); got != "https://mordaft.github.io" {
+		t.Fatalf("expected CORS header on root POST /, got %q", got)
+	}
 
 	// 3b. Discover published tools via tools/list and resources via resources/list
 	toolsList := callRPC("tools/list", map[string]any{})

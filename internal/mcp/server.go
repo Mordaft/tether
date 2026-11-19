@@ -76,6 +76,7 @@ func NewServer(
 		mcpserver.WithSSEEndpoint("/sse"),
 		mcpserver.WithMessageEndpoint("/message"),
 		mcpserver.WithUseFullURLForMessageEndpoint(false),
+		mcpserver.WithSSEDisableLocalhostProtection(true),
 		mcpserver.WithSSEContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			if sess, ok := auth.SessionFromContext(r.Context()); ok {
 				return auth.WithSession(ctx, sess)
@@ -92,6 +93,7 @@ func NewServer(
 		mcpSrv,
 		mcpserver.WithEndpointPath("/mcp"),
 		mcpserver.WithStateLess(true),
+		mcpserver.WithDisableLocalhostProtection(true),
 		mcpserver.WithStreamableHTTPLogger(discardLogger),
 		mcpserver.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			if sess, ok := auth.SessionFromContext(r.Context()); ok {
@@ -116,14 +118,22 @@ func NewServer(
 	mux.Handle("/message", authedSSE)
 	mux.Handle("/mcp", authedStreamable)
 	mux.Handle("/mcp/", authedStreamable)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		authedStreamable.ServeHTTP(w, r)
+	})
 
 	s.mux = mux
 	return s
 }
 
-// Handler returns the root HTTP handler serving /auth/connect, /sse, /message, and /mcp.
+// Handler returns the root HTTP handler serving /auth/connect, /sse, /message, and /mcp,
+// wrapped with CORS and Private Network Access middleware for browser/HTTPS origins.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return auth.CORSMiddleware(s.mux)
 }
 
 // MCPServer returns the underlying mark3labs MCPServer instance.

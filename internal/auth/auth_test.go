@@ -168,9 +168,37 @@ func TestTokenTamperingAndMissingHeader(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	req := httptest.NewRequest(http.MethodPost, "/mcp/message", nil)
+	req.Header.Set("Origin", "https://mordaft.github.io")
 	rec := httptest.NewRecorder()
 	protected.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 on missing Authorization header, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://mordaft.github.io" {
+		t.Fatalf("expected Access-Control-Allow-Origin on 401 response, got %q", got)
+	}
+
+	// 4. OPTIONS preflight on /auth/connect and Middleware must succeed with 204 and Private Network Access headers
+	for _, target := range []string{"/auth/connect", "/mcp", "/sse"} {
+		optReq := httptest.NewRequest(http.MethodOptions, target, nil)
+		optReq.Header.Set("Origin", "https://mordaft.github.io")
+		optReq.Header.Set("Access-Control-Request-Method", "POST")
+		optReq.Header.Set("Access-Control-Request-Headers", "authorization, content-type")
+		optReq.Header.Set("Access-Control-Request-Private-Network", "true")
+		optRec := httptest.NewRecorder()
+		if target == "/auth/connect" {
+			mgr.HandleConnect(optRec, optReq)
+		} else {
+			protected.ServeHTTP(optRec, optReq)
+		}
+		if optRec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 No Content for OPTIONS %s, got %d", target, optRec.Code)
+		}
+		if got := optRec.Header().Get("Access-Control-Allow-Origin"); got != "https://mordaft.github.io" {
+			t.Fatalf("expected Access-Control-Allow-Origin=https://mordaft.github.io on %s, got %q", target, got)
+		}
+		if got := optRec.Header().Get("Access-Control-Allow-Private-Network"); got != "true" {
+			t.Fatalf("expected Access-Control-Allow-Private-Network=true on %s, got %q", target, got)
+		}
 	}
 }
