@@ -190,7 +190,34 @@ func TestMCPServer_EndToEndToolsAndResources(t *testing.T) {
 		t.Fatalf("expected Command Guard PATH_TRAVERSAL error on '../outside.txt', got %s", string(evilBytes))
 	}
 
-	// 8. Close session via session_close
+	// 8. Sub-agent sharing the same workspace_root (e.g. localloop sub-agent or reconnected agent_id)
+	// must be able to execute commands on the same session without 403/404 session error.
+	subAgentSess, err := authMgr.IssueToken("agent-mcp-02", "MCP Sub-Agent", wsDir)
+	if err != nil {
+		t.Fatalf("IssueToken for sub-agent failed: %v", err)
+	}
+	subReqBody, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": ToolSessionExec,
+			"arguments": map[string]any{
+				"session_id": sessID,
+				"command":    "echo SUBAGENT_SHARED_WS_OK",
+			},
+		},
+	})
+	subReq := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(subReqBody))
+	subReq.Header.Set("Content-Type", "application/json")
+	subReq.Header.Set("Authorization", "Bearer "+subAgentSess.AccessToken)
+	subRec := httptest.NewRecorder()
+	handler.ServeHTTP(subRec, subReq)
+	if subRec.Code != http.StatusOK || !strings.Contains(subRec.Body.String(), "SUBAGENT_SHARED_WS_OK") {
+		t.Fatalf("expected sub-agent in same workspace to execute on %s, got (%d): %s", sessID, subRec.Code, subRec.Body.String())
+	}
+
+	// 9. Close session via session_close
 	closeRes := callRPC("tools/call", map[string]any{
 		"name": ToolSessionClose,
 		"arguments": map[string]any{
@@ -200,5 +227,19 @@ func TestMCPServer_EndToEndToolsAndResources(t *testing.T) {
 	closeBytes, _ := json.Marshal(closeRes)
 	if !strings.Contains(string(closeBytes), `\"closed\": true`) && !strings.Contains(string(closeBytes), `"closed":true`) {
 		t.Fatalf("expected session_close to report closed:true, got %s", string(closeBytes))
+	}
+
+	// 10. Subsequent session_exec referencing a closed session_id must transparently reopen a session
+	// in the authorized workspace rather than failing with "403/404 session error".
+	reopenRes := callRPC("tools/call", map[string]any{
+		"name": ToolSessionExec,
+		"arguments": map[string]any{
+			"session_id": sessID,
+			"command":    "echo AUTO_REOPEN_OK",
+		},
+	})
+	reopenBytes, _ := json.Marshal(reopenRes)
+	if !strings.Contains(string(reopenBytes), "AUTO_REOPEN_OK") {
+		t.Fatalf("expected session_exec after close to auto-reopen and output AUTO_REOPEN_OK, got %s", string(reopenBytes))
 	}
 }

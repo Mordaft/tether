@@ -211,6 +211,7 @@ func (s *Server) handleResourceSessions(ctx context.Context, req mcp.ReadResourc
 		return nil, fmt.Errorf("unauthorized: missing authenticated agent session in context")
 	}
 
+	s.ptyMgr.BindAgentWorkspace(agentSess.AgentID, agentSess.WorkspaceRoot)
 	sessions := s.ptyMgr.ListSessions(agentSess.AgentID)
 	if sessions == nil {
 		sessions = []bus.TerminalSession{}
@@ -288,11 +289,53 @@ func (s *Server) registerTools() {
 	s.mcpServer.AddTool(closeTool, s.handleToolSessionClose)
 }
 
+func (s *Server) resolveOrOpenSession(agentSess *auth.AgentSession, requestedID bus.SessionID, autoOpen bool) (bus.TerminalSession, error) {
+	s.ptyMgr.BindAgentWorkspace(agentSess.AgentID, agentSess.WorkspaceRoot)
+
+	if requestedID != "" {
+		if termSess, err := s.ptyMgr.GetSession(agentSess.AgentID, requestedID); err == nil && termSess.State != bus.StateClosed {
+			return termSess, nil
+		}
+	}
+
+	// Fallback 1: check if there is an active non-closed session in this agent's authorized workspace
+	var latestActive *bus.TerminalSession
+	for _, candidate := range s.ptyMgr.ListSessions(agentSess.AgentID) {
+		if candidate.State == bus.StateClosed {
+			continue
+		}
+		c := candidate
+		if latestActive == nil || c.LastOutputAt.After(latestActive.LastOutputAt) {
+			latestActive = &c
+		}
+	}
+	if latestActive != nil {
+		return *latestActive, nil
+	}
+
+	// Fallback 2: if autoOpen is enabled (e.g. session_exec called after session_close or without session_open),
+	// transparently open a session in the agent's authorized workspace_root.
+	if autoOpen {
+		return s.ptyMgr.OpenSessionWithID(
+			agentSess.AgentID,
+			agentSess.AgentName,
+			agentSess.WorkspaceRoot,
+			"",
+			"",
+			requestedID,
+		)
+	}
+
+	return bus.TerminalSession{}, pty.ErrSessionNotFound
+}
+
 func (s *Server) handleToolSessionOpen(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	agentSess, ok := auth.SessionFromContext(ctx)
 	if !ok {
 		return mcp.NewToolResultError("401 Unauthorized: missing authenticated agent session"), nil
 	}
+
+	s.ptyMgr.BindAgentWorkspace(agentSess.AgentID, agentSess.WorkspaceRoot)
 
 	var args struct {
 		Shell string `json:"shell"`
@@ -329,15 +372,12 @@ func (s *Server) handleToolSessionExec(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("invalid arguments: " + err.Error()), nil
 	}
 
-	sessID := bus.SessionID(strings.TrimSpace(args.SessionID))
-	if sessID == "" {
-		return mcp.NewToolResultError("session_id is required"), nil
-	}
-
-	termSess, err := s.ptyMgr.GetSession(agentSess.AgentID, sessID)
+	requestedID := bus.SessionID(strings.TrimSpace(args.SessionID))
+	termSess, err := s.resolveOrOpenSession(agentSess, requestedID, true)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("403/404 session error: %v", err)), nil
 	}
+	sessID := termSess.ID
 
 	// Pass command through Command Guard AST & human consent queue
 	verdict, err := s.cmdGuard.Authorize(ctx, agentSess, sessID, termSess.RelCWD, args.Command)
@@ -388,13 +428,14 @@ func (s *Server) handleToolSessionInput(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 
-	sessionID := bus.SessionID(strings.TrimSpace(req.GetString("session_id", "")))
+	requestedID := bus.SessionID(strings.TrimSpace(req.GetString("session_id", "")))
 	text := req.GetString("text", "")
-	if sessionID == "" {
-		return mcp.NewToolResultError("session_id is required"), nil
+	termSess, err := s.resolveOrOpenSession(agentSess, requestedID, false)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("session_input failed: %v", err)), nil
 	}
 
-	out, snap, err := s.ptyMgr.SendInput(agentSess.AgentID, sessionID, text, pressEnter)
+	out, snap, err := s.ptyMgr.SendInput(agentSess.AgentID, termSess.ID, text, pressEnter)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("session_input failed: %v", err)), nil
 	}
@@ -419,15 +460,17 @@ func (s *Server) handleToolSessionScreen(ctx context.Context, req mcp.CallToolRe
 	}
 	_ = req.BindArguments(&args)
 
-	sessionID := bus.SessionID(strings.TrimSpace(args.SessionID))
-	if sessionID == "" {
-		return mcp.NewToolResultError("session_id is required"), nil
-	}
+	requestedID := bus.SessionID(strings.TrimSpace(args.SessionID))
 	if args.Lines <= 0 {
 		args.Lines = 50
 	}
 
-	lines, snap, err := s.ptyMgr.Screen(agentSess.AgentID, sessionID, args.Lines)
+	termSess, err := s.resolveOrOpenSession(agentSess, requestedID, false)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("session_screen failed: %v", err)), nil
+	}
+
+	lines, snap, err := s.ptyMgr.Screen(agentSess.AgentID, termSess.ID, args.Lines)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("session_screen failed: %v", err)), nil
 	}
@@ -446,6 +489,8 @@ func (s *Server) handleToolSessionClose(ctx context.Context, req mcp.CallToolReq
 	if !ok {
 		return mcp.NewToolResultError("401 Unauthorized: missing authenticated agent session"), nil
 	}
+
+	s.ptyMgr.BindAgentWorkspace(agentSess.AgentID, agentSess.WorkspaceRoot)
 
 	sessionID := bus.SessionID(strings.TrimSpace(req.GetString("session_id", "")))
 	if sessionID == "" {

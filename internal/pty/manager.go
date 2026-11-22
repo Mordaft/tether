@@ -111,13 +111,14 @@ func WithIdleTimeout(d time.Duration) Option {
 
 // Manager maintains isolated per-AgentID namespaces of PTY sessions.
 type Manager struct {
-	mu          sync.RWMutex
-	sessions    map[AgentID]map[SessionID]*TerminalSession
-	sysInfo     env.SystemInfo
-	eventBus    *bus.EventBus
-	idleTimeout time.Duration
-	seq         atomic.Uint64
-	dirtyFlag   atomic.Bool
+	mu              sync.RWMutex
+	sessions        map[AgentID]map[SessionID]*TerminalSession
+	agentWorkspaces map[AgentID]string
+	sysInfo         env.SystemInfo
+	eventBus        *bus.EventBus
+	idleTimeout     time.Duration
+	seq             atomic.Uint64
+	dirtyFlag       atomic.Bool
 }
 
 // ConsumeDirty atomically checks and resets the dirty flag used by the 60 FPS TUI render loop.
@@ -133,15 +134,31 @@ func (m *Manager) MarkDirty() {
 // NewManager creates a multi-tenant PTY session manager.
 func NewManager(sysInfo env.SystemInfo, eventBus *bus.EventBus, opts ...Option) *Manager {
 	m := &Manager{
-		sessions:    make(map[AgentID]map[SessionID]*TerminalSession),
-		sysInfo:     sysInfo,
-		eventBus:    eventBus,
-		idleTimeout: DefaultIdleTimeout,
+		sessions:        make(map[AgentID]map[SessionID]*TerminalSession),
+		agentWorkspaces: make(map[AgentID]string),
+		sysInfo:         sysInfo,
+		eventBus:        eventBus,
+		idleTimeout:     DefaultIdleTimeout,
 	}
 	for _, opt := range opts {
 		opt(m)
 	}
 	return m
+}
+
+// BindAgentWorkspace associates an authenticated agentID with its canonical workspaceRoot
+// so multiple sub-agents or reconnections authorized for the same workspace can share PTY sessions.
+func (m *Manager) BindAgentWorkspace(agentID AgentID, workspaceRoot string) {
+	if strings.TrimSpace(string(agentID)) == "" || strings.TrimSpace(workspaceRoot) == "" {
+		return
+	}
+	wsAbs, err := env.ResolveSafeSubpath(workspaceRoot, ".")
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	m.agentWorkspaces[agentID] = wsAbs
+	m.mu.Unlock()
 }
 
 // SystemInfo returns the detected host environment information.
@@ -151,6 +168,11 @@ func (m *Manager) SystemInfo() env.SystemInfo {
 
 // OpenSession creates and starts a new isolated PTY session inside the agent's workspaceRoot.
 func (m *Manager) OpenSession(agentID AgentID, agentName, workspaceRoot, requestedShell, tabName string) (bus.TerminalSession, error) {
+	return m.OpenSessionWithID(agentID, agentName, workspaceRoot, requestedShell, tabName, "")
+}
+
+// OpenSessionWithID creates and starts a new isolated PTY session, optionally binding a requested SessionID if unoccupied.
+func (m *Manager) OpenSessionWithID(agentID AgentID, agentName, workspaceRoot, requestedShell, tabName string, preferredID SessionID) (bus.TerminalSession, error) {
 	if strings.TrimSpace(string(agentID)) == "" {
 		return bus.TerminalSession{}, errors.New("agent_id is required")
 	}
@@ -158,6 +180,11 @@ func (m *Manager) OpenSession(agentID AgentID, agentName, workspaceRoot, request
 	wsAbs, err := env.ResolveSafeSubpath(workspaceRoot, ".")
 	if err != nil {
 		return bus.TerminalSession{}, fmt.Errorf("invalid workspace root: %w", err)
+	}
+	if st, statErr := os.Stat(wsAbs); statErr != nil || !st.IsDir() {
+		if mkErr := os.MkdirAll(wsAbs, 0o755); mkErr != nil {
+			return bus.TerminalSession{}, fmt.Errorf("ensuring workspace directory %s: %w", wsAbs, mkErr)
+		}
 	}
 
 	shellInfo, err := m.sysInfo.ResolveShell(requestedShell)
@@ -184,6 +211,7 @@ func (m *Manager) OpenSession(agentID AgentID, agentName, workspaceRoot, request
 	pg, _ := attachProcessGroup(cmd.Process)
 
 	m.mu.Lock()
+	m.agentWorkspaces[agentID] = wsAbs
 	agentMap, exists := m.sessions[agentID]
 	if !exists {
 		agentMap = make(map[SessionID]*TerminalSession)
@@ -192,6 +220,11 @@ func (m *Manager) OpenSession(agentID AgentID, agentName, workspaceRoot, request
 	tabIdx := len(agentMap) + 1
 	seqNum := m.seq.Add(1)
 	sessID := SessionID(fmt.Sprintf("sess-%d", seqNum))
+	if pref := SessionID(strings.TrimSpace(string(preferredID))); pref != "" {
+		if _, taken := agentMap[pref]; !taken {
+			sessID = pref
+		}
+	}
 
 	displayAgent := strings.TrimSpace(agentName)
 	if displayAgent == "" {
@@ -354,20 +387,40 @@ func (m *Manager) GetSession(agentID AgentID, sessionID SessionID) (bus.Terminal
 	return ts.Snapshot(), nil
 }
 
-// ListSessions returns all sessions belonging strictly to agentID.
+// ListSessions returns all sessions belonging to agentID or sharing agentID's authorized workspaceRoot.
 func (m *Manager) ListSessions(agentID AgentID) []bus.TerminalSession {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	agentMap, ok := m.sessions[agentID]
-	if !ok || len(agentMap) == 0 {
-		return nil
+	wsAbs := m.agentWorkspaces[agentID]
+	seen := make(map[SessionID]bool)
+	var out []bus.TerminalSession
+
+	if agentMap, ok := m.sessions[agentID]; ok {
+		for id, ts := range agentMap {
+			seen[id] = true
+			out = append(out, ts.Snapshot())
+		}
 	}
 
-	out := make([]bus.TerminalSession, 0, len(agentMap))
-	for _, ts := range agentMap {
-		out = append(out, ts.Snapshot())
+	if wsAbs != "" {
+		for otherAgent, agentMap := range m.sessions {
+			if otherAgent == agentID {
+				continue
+			}
+			for id, ts := range agentMap {
+				if seen[id] {
+					continue
+				}
+				snap := ts.Snapshot()
+				if strings.EqualFold(snap.WorkspaceRoot, wsAbs) {
+					seen[id] = true
+					out = append(out, snap)
+				}
+			}
+		}
 	}
+
 	return out
 }
 
@@ -668,19 +721,16 @@ func (m *Manager) RawScreenForTUI(agentID AgentID, sessionID SessionID) string {
 // closes the PTY, and removes the session from the agent's namespace.
 func (m *Manager) CloseSession(agentID AgentID, sessionID SessionID) error {
 	m.mu.Lock()
-	agentMap, ok := m.sessions[agentID]
-	if !ok {
+	ownerID, resolvedID, ts := m.findSessionLocked(agentID, sessionID)
+	if ts == nil {
 		m.mu.Unlock()
 		return ErrSessionNotFound
 	}
-	ts, exists := agentMap[sessionID]
-	if !exists {
-		m.mu.Unlock()
-		return ErrSessionNotFound
-	}
-	delete(agentMap, sessionID)
-	if len(agentMap) == 0 {
-		delete(m.sessions, agentID)
+	if agentMap, ok := m.sessions[ownerID]; ok {
+		delete(agentMap, resolvedID)
+		if len(agentMap) == 0 {
+			delete(m.sessions, ownerID)
+		}
 	}
 	m.mu.Unlock()
 
@@ -734,15 +784,68 @@ func (m *Manager) lookupSession(agentID AgentID, sessionID SessionID) (*Terminal
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	agentMap, ok := m.sessions[agentID]
-	if !ok {
-		return nil, ErrSessionNotFound
-	}
-	ts, exists := agentMap[sessionID]
-	if !exists {
+	_, _, ts := m.findSessionLocked(agentID, sessionID)
+	if ts == nil {
 		return nil, ErrSessionNotFound
 	}
 	return ts, nil
+}
+
+func (m *Manager) findSessionLocked(agentID AgentID, sessionID SessionID) (AgentID, SessionID, *TerminalSession) {
+	raw := strings.TrimSpace(string(sessionID))
+	if raw == "" {
+		return "", "", nil
+	}
+
+	candidates := []SessionID{SessionID(raw)}
+	if !strings.HasPrefix(strings.ToLower(raw), "sess-") {
+		candidates = append(candidates, SessionID("sess-"+raw))
+	}
+
+	// 1. Direct lookup in agentID's own session map (by exact ID, "sess-<id>", or tab name)
+	if agentMap, ok := m.sessions[agentID]; ok {
+		for _, cand := range candidates {
+			if ts, exists := agentMap[cand]; exists {
+				return agentID, cand, ts
+			}
+		}
+		for id, ts := range agentMap {
+			snap := ts.Snapshot()
+			if strings.EqualFold(snap.Name, raw) || strings.HasSuffix(strings.ToLower(snap.Name), "("+strings.ToLower(raw)+")") {
+				return agentID, id, ts
+			}
+		}
+	}
+
+	// 2. Workspace-scoped lookup: allow sub-agents or re-authenticated connections sharing the
+	// exact same authorized WorkspaceRoot to access sessions within that workspace.
+	wsAbs := m.agentWorkspaces[agentID]
+	if wsAbs != "" {
+		for otherAgent, agentMap := range m.sessions {
+			if otherAgent == agentID {
+				continue
+			}
+			for _, cand := range candidates {
+				if ts, exists := agentMap[cand]; exists {
+					snap := ts.Snapshot()
+					if strings.EqualFold(snap.WorkspaceRoot, wsAbs) {
+						return otherAgent, cand, ts
+					}
+				}
+			}
+			for id, ts := range agentMap {
+				snap := ts.Snapshot()
+				if !strings.EqualFold(snap.WorkspaceRoot, wsAbs) {
+					continue
+				}
+				if strings.EqualFold(snap.Name, raw) || strings.HasSuffix(strings.ToLower(snap.Name), "("+strings.ToLower(raw)+")") {
+					return otherAgent, id, ts
+				}
+			}
+		}
+	}
+
+	return "", "", nil
 }
 
 func buildNonInteractiveEnv(base []string) []string {
